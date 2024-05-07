@@ -24,7 +24,11 @@
 #include "NoiseSource.h"
 #include "ChaCha.h"
 #include "Crypto.h"
+#if defined(ARDUINO)
 #include <Arduino.h>
+#else
+#include <time.h>
+#endif
 #include "utility/ProgMemUtil.h"
 #if defined (__arm__) && defined (__SAM3X8E__)
 // The Arduino Due does not have any EEPROM natively on the main chip.
@@ -299,6 +303,21 @@ ISR(RTC_CNT_vect)
 #endif
 
 /** @endcond */
+
+#if !defined(ARDUINO)
+unsigned long millis() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // return milliseconds
+    return (unsigned long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+unsigned long micros() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // return microseconds
+    return (unsigned long)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+}
+#endif
 
 /**
  * \brief Constructs a new random number generator instance.
