@@ -34,6 +34,8 @@
 // The Arduino Due does not have any EEPROM natively on the main chip.
 // However, it does have a TRNG and flash memory.
 #define RNG_DUE_TRNG 1
+#elif defined(ARDUINO_ARCH_NRF52) || defined(ARDUINO_NRF52_ADAFRUIT)
+#define RNG_NRF52_TRNG 1
 #elif defined(__AVR__)
 #include <avr/eeprom.h>
 #include <avr/wdt.h>
@@ -78,6 +80,7 @@
 //    2. Provide a proper noise source like TransistorNoiseSource
 //       in your sketch and then comment out the #warning line below.
 #if !defined(RNG_DUE_TRNG) && \
+    !defined(RNG_NRF52_TRNG) && \
     !defined(RNG_WATCHDOG) && \
     !defined(RNG_WORD_TRNG) && \
     !defined(RNG_CCL)
@@ -439,6 +442,23 @@ static void eraseAndWriteSeed()
         ;   // do nothing until FRDY rises.
 }
 
+#elif defined(RNG_NRF52_TRNG)
+
+// Stir in the unique identifier for the Arduino Due's CPU.
+static void stirUniqueIdentifier(void)
+{
+    uint32_t id[4];
+
+    // Read the identifier from nr52 registers
+    id[0] = NRF_FICR->DEVICEID[0];
+    id[1] = NRF_FICR->DEVICEID[1];
+    id[2] = NRF_FICR->DEVICEADDR[0];
+    id[3] = NRF_FICR->DEVICEADDR[1];
+
+    // Stir the unique identifier into the entropy pool.
+    RNG.stir((uint8_t *)id, sizeof(id));
+}
+
 #endif
 
 /**
@@ -489,6 +509,11 @@ void RNGClass::begin(const char *tag)
     REG_TRNG_CR = TRNG_CR_KEY(0x524E47) | TRNG_CR_ENABLE;
     REG_TRNG_IDR = TRNG_IDR_DATRDY; // Disable interrupts - we will poll.
     mixTRNG();
+#elif defined(RNG_NRF52_TRNG)
+    // If the device has just been reprogrammed, there will be no saved seed.
+    // XOR the initialization block with some output from the CPU's TRNG
+    // to permute the state in a first boot situation after reprogramming.
+    mixTRNG();
 #endif
 #if defined(RNG_ESP_NVS)
     // Do we have a seed saved in ESP non-volatile storage (NVS)?
@@ -525,6 +550,10 @@ void RNGClass::begin(const char *tag)
         stir((const uint8_t *)tag, strlen(tag));
 
 #if defined(RNG_DUE_TRNG)
+    // Stir in the unique identifier for the CPU so that different
+    // devices will give different outputs even without seeding.
+    stirUniqueIdentifier();
+#elif defined(RNG_NRF52_TRNG)
     // Stir in the unique identifier for the CPU so that different
     // devices will give different outputs even without seeding.
     stirUniqueIdentifier();
@@ -952,6 +981,29 @@ void RNGClass::loop()
         }
         trngPending = 1;
     }
+#elif defined(RNG_NRF52_TRNG)
+    // If there is data available from the Arudino Due's TRNG, then XOR
+    // it with the state block and increase the entropy credit.  We don't
+    // call stir() yet because that will seriously slow down the system
+    // given how fast the TRNG is.  Instead we save up the XOR'ed TRNG
+    // data until the next rand() call and then hash it to generate the
+    // desired output.
+    uint8_t available = 0;
+    if (sd_rand_application_bytes_available_get(&available) == NRF_SUCCESS && available >= 4) {
+        uint32_t value = 0;
+        if (sd_rand_application_vector_get((uint8_t*)&value, 4) == NRF_SUCCESS) {
+            block[4 + trngPosn] ^= value;
+            if (++trngPosn >= 12)
+                trngPosn = 0;
+            if (credits < RNG_MAX_CREDITS) {
+                // Credit 1 bit of entropy for the word.  The TRNG should be
+                // better than this but it is so fast that we want to collect
+                // up more data before passing it to the application.
+                ++credits;
+            }
+            trngPending = 1;
+        }
+    }
 #elif defined(RNG_WORD_TRNG)
     // Read a word from the TRNG and XOR it into the state.
     block[4 + trngPosn] ^= RNG_WORD_TRNG_GET();
@@ -1115,6 +1167,25 @@ void RNGClass::mixTRNG()
         if (counter >= 200)
             break;
         block[posn + 4] ^= REG_TRNG_ODATA;
+    }
+#elif defined(RNG_NRF52_TRNG)
+    // Mix in 12 words from the NRF52 TRNG
+    for (int posn = 0; posn < 12; ++posn) {
+        uint32_t value = 0;
+        int counter;
+        uint8_t available = 0;
+        for (counter = 0; counter < 200 && available < 4; ++counter) {
+            if (sd_rand_application_bytes_available_get(&available) != NRF_SUCCESS) {
+                break;
+            }
+        }
+        if (available < 4) {
+            break;
+        }
+        if (sd_rand_application_vector_get((uint8_t*)&value, 4) != NRF_SUCCESS) {
+                break;
+        }
+        block[posn + 4] ^= value;
     }
 #elif defined(RNG_WORD_TRNG)
     // Read 12 words from the TRNG and XOR them into the state.
